@@ -27,7 +27,7 @@ import pyodbc
 
 def parse_args():
     ap = argparse.ArgumentParser(description="Kiểm chứng đồng thời FitLifeHub")
-    ap.add_argument("kich_ban", choices=["overbook", "checkin"])
+    ap.add_argument("kich_ban", choices=["overbook", "checkin", "spa_checkin", "payment"])
     ap.add_argument("--mode", choices=["naive", "safe"], default="safe")
     ap.add_argument("--threads", type=int, default=50)
     ap.add_argument("--requests", type=int, default=10000)
@@ -191,7 +191,7 @@ def checkin(a, cs):
         sys.exit("Không có hội viên nào còn quyền vào cổng định kỳ.")
     reqs = [random.choice(cards) for _ in range(need)]
     doors = [1, 2, 3, 4]                      # 4 cửa của chi nhánh 1
-    t_start = datetime.now()
+    t_start = datetime.now().replace(microsecond=0)
     lat = []
     rej = [0]
     lock = threading.Lock()
@@ -253,10 +253,115 @@ def checkin(a, cs):
     c.close()
 
 
+# ---------------------------------------------------------------------------
+# Kiểm chứng đồng thời bổ sung: vé Spa lẻ (RB35) và thanh toán hóa đơn (RB26)
+# ---------------------------------------------------------------------------
+def spa_checkin(a, cs):
+    """Nhiều luồng cùng quét 1 vé Spa lẻ (1 lượt): chỉ đúng 1 lượt HOP_LE, còn lại TU_CHOI."""
+    n = max(2, min(a.threads, 20))
+    c = connect(cs)
+    cur = c.cursor()
+    row = cur.execute("""
+        SELECT TOP (1) hv.ma_the, q.ma_goi_mua, h.ma_cn
+        FROM dbo.QUYEN_VAO_CONG q
+        JOIN dbo.HOI_VIEN hv ON hv.ma_hv = q.ma_hv AND hv.trang_thai = 'HOAT_DONG'
+        JOIN dbo.GOI_DA_MUA g ON g.ma_goi_mua = q.ma_goi_mua AND g.trang_thai = 'HIEU_LUC'
+        JOIN dbo.HOA_DON h ON h.ma_hd = g.ma_hd
+        WHERE q.so_luot_con_lai = 1 AND q.ngay_het_han >= CAST(SYSDATETIME() AS DATE)
+        ORDER BY NEWID()""").fetchone()
+    if not row:
+        sys.exit("Không tìm thấy hội viên nào có vé Spa lẻ còn 1 lượt.")
+    ma_the, ma_goi_mua, ma_cn = row
+    cua = cur.execute("SELECT TOP (1) ma_cua FROM dbo.CUA_KIEM_SOAT WHERE ma_cn=? AND trang_thai='HOAT_DONG'", ma_cn).fetchone()[0]
+    t_start = datetime.now().replace(microsecond=0)
+    barrier = threading.Barrier(n + 1)
+    res = {"ok": 0, "rej": 0, "err": 0}
+    lock = threading.Lock()
+
+    def worker():
+        cn = connect(cs)
+        cu = cn.cursor()
+        try:
+            barrier.wait()
+            cu.execute("EXEC dbo.sp_CheckIn @ma_the=?, @ma_cua=?", ma_the, cua)
+            r = cu.fetchone()
+            with lock:
+                if r and r[0] == "HOP_LE":
+                    res["ok"] += 1
+                else:
+                    res["rej"] += 1
+        except pyodbc.Error:
+            with lock:
+                res["err"] += 1
+        finally:
+            cn.close()
+
+    ts = [threading.Thread(target=worker) for _ in range(n)]
+    for t in ts:
+        t.start()
+    barrier.wait()
+    for t in ts:
+        t.join()
+    print(f"Vé Spa #{ma_goi_mua} ({ma_the}), {n} luồng: HOP_LE={res['ok']} (đúng=1), TU_CHOI={res['rej']}, Lỗi={res['err']}")
+    if not a.keep:
+        cur.execute("ALTER TABLE dbo.CHECK_IN DISABLE TRIGGER trg_CHECK_IN_nodel")
+        try:
+            cur.execute("DELETE FROM dbo.CHECK_IN WHERE tg_vao >= ? AND ma_hv = (SELECT ma_hv FROM dbo.HOI_VIEN WHERE ma_the=?)", t_start, ma_the)
+            cur.execute("UPDATE dbo.GOI_DA_MUA SET so_buoi_con_lai=1, trang_thai='HIEU_LUC' WHERE ma_goi_mua=?", ma_goi_mua)
+        finally:
+            cur.execute("ALTER TABLE dbo.CHECK_IN ENABLE TRIGGER trg_CHECK_IN_nodel")
+    c.close()
+
+
+def payment(a, cs):
+    """Nhiều luồng cùng thanh toán đủ 1 hóa đơn CHO_THANH_TOAN: chỉ đúng 1 luồng thành công."""
+    n = max(2, min(a.threads, 20))
+    c = connect(cs)
+    cur = c.cursor()
+    row = cur.execute("""
+        SELECT TOP (1) h.ma_hd, h.thanh_toan
+        FROM dbo.HOA_DON h
+        WHERE h.trang_thai = 'CHO_THANH_TOAN'
+          AND NOT EXISTS (SELECT 1 FROM dbo.THANH_TOAN t WHERE t.ma_hd = h.ma_hd AND t.trang_thai = 'THANH_CONG')
+        ORDER BY h.ma_hd DESC""").fetchone()
+    if not row:
+        sys.exit("Không có hóa đơn CHO_THANH_TOAN chưa trả tiền nào để test.")
+    ma_hd, so_tien = row
+    barrier = threading.Barrier(n + 1)
+    res = {"ok": 0, "rej": 0}
+    lock = threading.Lock()
+
+    def worker():
+        cn = connect(cs)
+        cu = cn.cursor()
+        try:
+            barrier.wait()
+            cu.execute("EXEC dbo.sp_ThanhToan @ma_hd=?, @hinh_thuc='TIEN_MAT', @so_tien=?", ma_hd, so_tien)
+            while cu.nextset():
+                pass
+            with lock:
+                res["ok"] += 1
+        except pyodbc.Error:
+            with lock:
+                res["rej"] += 1
+        finally:
+            cn.close()
+
+    ts = [threading.Thread(target=worker) for _ in range(n)]
+    for t in ts:
+        t.start()
+    barrier.wait()
+    for t in ts:
+        t.join()
+    cnt = cur.execute("SELECT COUNT(*) FROM dbo.THANH_TOAN WHERE ma_hd=? AND trang_thai='THANH_CONG'", ma_hd).fetchone()[0]
+    print(f"Hóa đơn #{ma_hd}, {n} luồng: thành công={res['ok']} (đúng=1), từ chối={res['rej']}, dòng THANH_CONG={cnt}")
+    c.close()
+
+
 def main():
     a = parse_args()
     cs = conn_string(a)
-    {"overbook": overbook, "checkin": checkin}[a.kich_ban](a, cs)
+    {"overbook": overbook, "checkin": checkin, "spa_checkin": spa_checkin, "payment": payment}[a.kich_ban](a, cs)
 
 
 if __name__ == "__main__":

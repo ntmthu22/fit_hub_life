@@ -14,7 +14,7 @@
 
 ## 2. Môi trường & cách chạy
 - SQL Server (phiên bản ____, edition ____), máy: CPU ____, RAM ____, SSD/HDD ____.
-- Thứ tự chạy: `01_create_schema.sql` → `02_generate_data.py` → `03_procedures_triggers.sql` → `04_scenarios.sql` → `05_test_concurrency.py` → `app/app.py`.
+- Thứ tự chạy: `01_create_schema.sql` → `02_generate_data.py` → `03_procedures_triggers.sql` → `04_scenarios.sql` → `05_test_concurrency.py` → `app.py`.
 - Quy mô dữ liệu sau khi sinh (điền từ `SELECT COUNT(*)`): CHECK_IN ____, HOA_DON ____, GOI_DA_MUA ____, LICH_HEN_PT ____, HOI_VIEN ____ (mỗi bảng minh họa ≥ 70.000 dòng).
 
 ## 3. Thiết kế vật lý
