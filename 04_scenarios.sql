@@ -116,7 +116,12 @@ BEGIN
     DECLARE @goi dbo.ds_goi, @sp dbo.ds_sp, @hd BIGINT, @tien DECIMAL(15,0), @hv INT, @i INT = 0,
             @max INT = (SELECT COUNT(*) FROM #m), @t0 DATETIME2(7), @ms INT,
             @nv INT = (SELECT TOP (1) ma_nv FROM dbo.LICH_SU_CONG_TAC WHERE ma_cn = 1 AND chuc_vu = 'LE_TAN' AND den_ngay IS NULL ORDER BY ma_nv),
-            @sp1 INT = (SELECT TOP (1) ma_sp FROM dbo.TON_KHO WHERE ma_cn = 1 AND so_luong_ton >= 100 ORDER BY ma_sp);
+            @sp1 INT = (SELECT TOP (1) t.ma_sp
+                        FROM dbo.TON_KHO t
+                        JOIN dbo.SAN_PHAM p ON p.ma_sp = t.ma_sp AND p.trang_thai = 'DANG_BAN'
+                        WHERE t.ma_cn = 1 AND t.so_luong_ton >= @n
+                        ORDER BY t.so_luong_ton DESC, t.ma_sp);
+    IF @sp1 IS NULL THROW 51099, N'Không tìm thấy sản phẩm DANG_BAN có đủ tồn kho cho benchmark', 1;
     INSERT INTO @goi VALUES (1);              -- Gym 3 tháng (bán ở mọi chi nhánh)
     INSERT INTO @sp VALUES (@sp1, 1);
     SET @t0 = SYSDATETIME();

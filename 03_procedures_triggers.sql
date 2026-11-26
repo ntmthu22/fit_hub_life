@@ -354,8 +354,9 @@ BEGIN
         IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION;
         THROW 51042, N'RB42: hóa đơn phải có ít nhất một dòng gói hoặc sản phẩm', 1;
     END
-    -- RB41: hóa đơn có gói bắt buộc có hội viên
-    IF EXISTS (SELECT 1 FROM @x x WHERE x.ma_hv IS NULL AND x.goi_sum > 0)
+    -- RB41: hóa đơn có gói bắt buộc có hội viên (kể cả gói giá 0đ)
+    IF EXISTS (SELECT 1 FROM @x x WHERE x.ma_hv IS NULL
+                                    AND EXISTS (SELECT 1 FROM dbo.GOI_DA_MUA g WHERE g.ma_hd = x.ma_hd))
     BEGIN
         IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION;
         THROW 51041, N'RB41: hóa đơn có gói dịch vụ bắt buộc có hội viên', 1;
@@ -369,7 +370,24 @@ BEGIN
     JOIN dbo.GOI_DICH_VU d ON d.ma_goi = g.ma_goi
     WHERE g.trang_thai = 'CHO_KICH_HOAT';
 
-    -- hủy: hủy gói + hoàn kho (RB29)
+    -- hủy: chặn nếu gói PT đã có buổi hoàn thành; tự hủy các lịch DA_DAT; hủy gói + hoàn kho (RB29)
+    IF EXISTS (SELECT 1
+               FROM @x x
+               JOIN dbo.GOI_DA_MUA g ON g.ma_hd = x.ma_hd
+               JOIN dbo.LICH_HEN_PT p ON p.ma_goi_mua = g.ma_goi_mua
+               WHERE x.hanh_dong IN ('R','C') AND p.trang_thai = 'DA_HOAN_THANH')
+    BEGIN
+        IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION;
+        THROW 51043, N'Không thể hủy hóa đơn có gói PT đã có buổi tập hoàn thành', 1;
+    END
+
+    UPDATE p SET p.trang_thai = 'DA_HUY', p.ly_do_huy = N'Hủy tự động do hủy hóa đơn',
+                 p.diem_danh_gia = NULL, p.nhan_xet = NULL
+    FROM dbo.LICH_HEN_PT p
+    JOIN dbo.GOI_DA_MUA g ON g.ma_goi_mua = p.ma_goi_mua
+    JOIN @x x ON x.ma_hd = g.ma_hd AND x.hanh_dong IN ('R','C')
+    WHERE p.trang_thai = 'DA_DAT';
+
     UPDATE g SET g.trang_thai = 'DA_HUY'
     FROM dbo.GOI_DA_MUA g JOIN @x x ON x.ma_hd = g.ma_hd AND x.hanh_dong IN ('R','C')
     WHERE g.trang_thai <> 'DA_HUY';
@@ -385,6 +403,17 @@ BEGIN
     INSERT INTO dbo.GIAO_DICH_DIEM (ma_hv, ma_hd, loai_gd, so_diem, ngay_gd, ghi_chu)
     SELECT x.ma_hv, x.ma_hd, 'TICH', x.pts, SYSDATETIME(), NULL
     FROM @x x WHERE x.hanh_dong = 'P' AND x.ma_hv IS NOT NULL AND x.pts > 0;
+
+    IF EXISTS (SELECT 1
+               FROM (SELECT g.ma_hv, SUM(g.so_diem) AS hoan
+                     FROM @x x JOIN dbo.GIAO_DICH_DIEM g ON g.ma_hd = x.ma_hd AND g.loai_gd = 'TICH'
+                     WHERE x.hanh_dong = 'R' GROUP BY g.ma_hv) r
+               JOIN dbo.TAI_KHOAN_LOYALTY t ON t.ma_hv = r.ma_hv
+               WHERE t.diem_hien_co < r.hoan)
+    BEGIN
+        IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION;
+        THROW 51044, N'Không thể hủy hóa đơn vì hội viên đã sử dụng điểm thưởng tích từ hóa đơn này', 1;
+    END
 
     INSERT INTO dbo.GIAO_DICH_DIEM (ma_hv, ma_hd, loai_gd, so_diem, ngay_gd, ghi_chu)
     SELECT g.ma_hv, x.ma_hd, 'HOAN_TICH', -g.so_diem, SYSDATETIME(), N'Hoàn điểm do hủy hóa đơn'
@@ -410,9 +439,11 @@ BEGIN
     WHEN MATCHED THEN UPDATE SET tg.tong_chi_tieu = CASE WHEN tg.tong_chi_tieu + s.s < 0 THEN 0 ELSE tg.tong_chi_tieu + s.s END
     WHEN NOT MATCHED AND s.s > 0 THEN INSERT (ma_hv, thang, tong_chi_tieu) VALUES (s.ma_hv, s.thang, s.s);
 
-    -- vấn đề 3: bảng tổng hợp doanh thu cộng gia tăng
+    -- vấn đề 3: bảng tổng hợp doanh thu cộng gia tăng (phân bổ giảm giá tối đa vào gói, phần dư trừ vào SP để không âm)
     MERGE dbo.TH_DOANH_THU_NGAY WITH (HOLDLOCK) AS tg
-    USING (SELECT ma_cn, ngay, SUM(sgn) AS hd, SUM(sgn * (goi_sum - giam)) AS g, SUM(sgn * sp_sum) AS p
+    USING (SELECT ma_cn, ngay, SUM(sgn) AS hd,
+                  SUM(sgn * (goi_sum - CASE WHEN giam > goi_sum THEN goi_sum ELSE giam END)) AS g,
+                  SUM(sgn * (sp_sum  - CASE WHEN giam > goi_sum THEN giam - goi_sum ELSE 0 END)) AS p
            FROM @x WHERE hanh_dong IN ('P','R') GROUP BY ma_cn, ngay) AS s
        ON tg.ma_cn = s.ma_cn AND tg.ngay = s.ngay
     WHEN MATCHED THEN UPDATE SET tg.so_hoa_don = tg.so_hoa_don + s.hd,
@@ -446,8 +477,11 @@ BEGIN
     DECLARE @ngay DATE = CAST(@tg AS DATE), @ma_cn SMALLINT, @ma_hv INT, @tt_hv VARCHAR(10),
             @ma_goi_mua BIGINT, @luot INT, @ly_do NVARCHAR(100), @ma_checkin BIGINT;
 
-    SELECT @ma_cn = ma_cn FROM dbo.CUA_KIEM_SOAT WHERE ma_cua = @ma_cua AND trang_thai = 'HOAT_DONG';
-    IF @ma_cn IS NULL THROW 50001, N'Cửa kiểm soát không tồn tại hoặc đang bảo trì', 1;
+    SELECT @ma_cn = k.ma_cn
+    FROM dbo.CUA_KIEM_SOAT k
+    JOIN dbo.CHI_NHANH cn ON cn.ma_cn = k.ma_cn AND cn.trang_thai = 'HOAT_DONG'
+    WHERE k.ma_cua = @ma_cua AND k.trang_thai = 'HOAT_DONG';
+    IF @ma_cn IS NULL THROW 50001, N'Cửa kiểm soát không tồn tại, đang bảo trì hoặc chi nhánh không hoạt động', 1;
 
     SELECT @ma_hv = ma_hv, @tt_hv = trang_thai FROM dbo.HOI_VIEN WHERE ma_the = @ma_the;
     IF @ma_hv IS NULL
@@ -528,10 +562,12 @@ BEGIN
                    WHERE g.ma_goi_mua = @ma_goi_mua AND h.ma_hv = @ma_hv AND v.nhom_dv = 'PT'
                      AND g.trang_thai = 'HIEU_LUC' AND @ngay_tap BETWEEN g.ngay_bat_dau AND g.ngay_het_han)
         THROW 50012, N'Gói PT không thuộc hội viên, không còn hiệu lực hoặc đã hết hạn tại ngày tập', 1;
-    SET @ma_cn = (SELECT TOP (1) ma_cn FROM dbo.LICH_SU_CONG_TAC
-                  WHERE ma_nv = @ma_hlv AND chuc_vu = 'PT' AND tu_ngay <= @ngay_tap
-                    AND (den_ngay IS NULL OR @ngay_tap < den_ngay));
-    IF @ma_cn IS NULL THROW 50013, N'Người này không phải HLV (PT) đang công tác vào ngày tập', 1;
+    SET @ma_cn = (SELECT TOP (1) l.ma_cn
+                  FROM dbo.LICH_SU_CONG_TAC l
+                  JOIN dbo.CHI_NHANH cn ON cn.ma_cn = l.ma_cn AND cn.trang_thai = 'HOAT_DONG'
+                  WHERE l.ma_nv = @ma_hlv AND l.chuc_vu = 'PT' AND l.tu_ngay <= @ngay_tap
+                    AND (l.den_ngay IS NULL OR @ngay_tap < l.den_ngay));
+    IF @ma_cn IS NULL THROW 50013, N'Người này không phải HLV (PT) đang công tác tại chi nhánh hoạt động vào ngày tập', 1;
 
     BEGIN TRY
         BEGIN TRAN;
@@ -598,6 +634,8 @@ BEGIN
             @goi_sum DECIMAL(15,0), @sp_sum DECIMAL(15,0), @today DATE = CAST(SYSDATETIME() AS DATE);
 
     IF @ng + @ns = 0 THROW 51001, N'RB42: hóa đơn phải có ít nhất một gói hoặc sản phẩm', 1;
+    IF NOT EXISTS (SELECT 1 FROM dbo.CHI_NHANH WHERE ma_cn = @ma_cn AND trang_thai = 'HOAT_DONG')
+        THROW 51009, N'Chi nhánh không tồn tại hoặc không hoạt động', 1;
     IF @ma_hv IS NULL AND @ng > 0 THROW 51002, N'RB41: hóa đơn có gói bắt buộc có hội viên', 1;
     IF @ma_hv IS NOT NULL AND NOT EXISTS (SELECT 1 FROM dbo.HOI_VIEN WHERE ma_hv = @ma_hv AND trang_thai = 'HOAT_DONG')
         THROW 51003, N'Hội viên không tồn tại hoặc đang bị khóa', 1;
@@ -671,9 +709,11 @@ BEGIN
     BEGIN TRAN;
     SELECT @tt = trang_thai FROM dbo.HOA_DON WITH (UPDLOCK, HOLDLOCK) WHERE ma_hd = @ma_hd;
     IF @tt IS NULL OR @tt = 'DA_HUY' THROW 51020, N'Hóa đơn không tồn tại hoặc đã hủy', 1;
-    IF @tt = 'DA_THANH_TOAN'
+    IF EXISTS (SELECT 1 FROM dbo.THANH_TOAN WHERE ma_hd = @ma_hd AND trang_thai = 'THANH_CONG')
         INSERT INTO dbo.THANH_TOAN (ma_hd, hinh_thuc, so_tien, ma_giao_dich_cong, trang_thai)
-        SELECT ma_hd, hinh_thuc, so_tien, CASE WHEN ma_giao_dich_cong IS NULL THEN NULL ELSE 'RF' + ma_giao_dich_cong END, 'HOAN_TIEN'
+        SELECT ma_hd, hinh_thuc, so_tien,
+               CASE WHEN ma_giao_dich_cong IS NULL THEN NULL ELSE LEFT('RF' + ma_giao_dich_cong, 50) END,
+               'HOAN_TIEN'
         FROM dbo.THANH_TOAN WHERE ma_hd = @ma_hd AND trang_thai = 'THANH_CONG';
     UPDATE dbo.HOA_DON SET trang_thai = 'DA_HUY' WHERE ma_hd = @ma_hd;
     COMMIT;
@@ -802,7 +842,10 @@ BEGIN
     SELECT c.ma_cn, @ngay, h.gio,
            SUM(CASE WHEN DATEPART(HOUR, c.tg_vao) = h.gio THEN 1 ELSE 0 END), COUNT(*)
     FROM dbo.CHECK_IN c
-    JOIN h ON DATEPART(HOUR, c.tg_vao) <= h.gio AND DATEPART(HOUR, ISNULL(c.tg_ra, c.tg_vao)) >= h.gio
+    JOIN h ON DATEPART(HOUR, c.tg_vao) <= h.gio
+          AND CASE WHEN c.tg_ra IS NULL THEN DATEPART(HOUR, c.tg_vao)
+                   WHEN CAST(c.tg_ra AS DATE) > @ngay THEN 23
+                   ELSE DATEPART(HOUR, c.tg_ra) END >= h.gio
     WHERE c.tg_vao >= @t0 AND c.tg_vao < @t1 AND c.ket_qua = 'HOP_LE'
     GROUP BY c.ma_cn, h.gio;
     COMMIT;
@@ -1015,7 +1058,8 @@ BEGIN
                  t.ngay_xet_hang = CAST(SYSDATETIME() AS DATE)
     FROM dbo.TAI_KHOAN_LOYALTY t
     LEFT JOIN (SELECT ma_hv, SUM(tong_chi_tieu) AS tong FROM dbo.CHI_TIEU_THANG_HV GROUP BY ma_hv) s ON s.ma_hv = t.ma_hv
-    WHERE t.tong_chi_tieu_12t <> ISNULL(s.tong, 0);
+    WHERE t.tong_chi_tieu_12t <> ISNULL(s.tong, 0)
+       OR t.ma_hang <> dbo.fn_HangTheoChiTieu(ISNULL(s.tong, 0));
     COMMIT;
 END;
 GO
@@ -1058,6 +1102,38 @@ BEGIN
       AND NOT EXISTS (SELECT 1 FROM dbo.LICH_SU_CONG_TAC l
                       WHERE l.ma_cn = cn.ma_cn AND l.chuc_vu = 'QUAN_LY' AND l.den_ngay IS NULL);
 END;
+GO
+
+/* =====================================================================
+   8. CHỈ MỤC TỐI ƯU (đồng bộ với ghi chú ở 01_create_schema.sql)
+   Chạy lại an toàn (kiểm tra tồn tại trước khi tạo).
+   04_scenarios.sql sẽ chủ động DROP/CREATE lại từng chỉ mục để đo trước/sau.
+   ===================================================================== */
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'IX_CHECKIN_open' AND object_id = OBJECT_ID(N'dbo.CHECK_IN'))
+    CREATE NONCLUSTERED INDEX IX_CHECKIN_open ON dbo.CHECK_IN (ma_hv, tg_vao)
+        WHERE tg_ra IS NULL AND ket_qua = 'HOP_LE'
+        ON ps_checkin_thang(tg_vao);
+GO
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'IX_HOA_DON_ma_hv' AND object_id = OBJECT_ID(N'dbo.HOA_DON'))
+    CREATE NONCLUSTERED INDEX IX_HOA_DON_ma_hv ON dbo.HOA_DON (ma_hv)
+        INCLUDE (ngay_lap, thanh_toan, trang_thai, ma_cn);
+GO
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'IX_GOI_DA_MUA_ma_hd' AND object_id = OBJECT_ID(N'dbo.GOI_DA_MUA'))
+    CREATE NONCLUSTERED INDEX IX_GOI_DA_MUA_ma_hd ON dbo.GOI_DA_MUA (ma_hd)
+        INCLUDE (ma_goi, trang_thai, ngay_het_han, so_buoi_con_lai, don_gia);
+GO
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'IX_LHPT_ngay_tt' AND object_id = OBJECT_ID(N'dbo.LICH_HEN_PT'))
+    CREATE NONCLUSTERED INDEX IX_LHPT_ngay_tt ON dbo.LICH_HEN_PT (ngay_tap, trang_thai)
+        INCLUDE (ma_hlv, ma_cn, ma_goi_mua);
+GO
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'IX_HOI_VIEN_ho_ten' AND object_id = OBJECT_ID(N'dbo.HOI_VIEN'))
+    CREATE NONCLUSTERED INDEX IX_HOI_VIEN_ho_ten ON dbo.HOI_VIEN (ho_ten)
+        INCLUDE (ma_the, sdt, cccd, email, gioi_tinh, ngay_sinh, ngay_dang_ky, trang_thai);
+GO
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'IX_CHECKIN_hv_tg' AND object_id = OBJECT_ID(N'dbo.CHECK_IN'))
+    CREATE NONCLUSTERED INDEX IX_CHECKIN_hv_tg ON dbo.CHECK_IN (ma_hv, tg_vao)
+        INCLUDE (ma_cn, ma_cua, tg_ra, ket_qua)
+        ON ps_checkin_thang(tg_vao);
 GO
 
 /* =====================================================================

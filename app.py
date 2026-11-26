@@ -16,22 +16,25 @@ Chạy:
     python app.py --user sa --password "..."
 """
 import argparse
+import functools
 import os
 import re
+import secrets
 from datetime import date, timedelta
 
 import jinja2
-from flask import Flask, flash, redirect, render_template, request, url_for
+from flask import Flask, abort, flash, g, redirect, render_template, request, session, url_for
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("FITLIFE_SECRET") or os.urandom(32)
+STAFF_PIN = os.environ.get("FITLIFE_STAFF_PIN", "123456")
 
 CONFIG = {"server": os.environ.get("FITLIFE_SERVER", "localhost"), "database": "FitLifeHub",
           "user": None, "password": os.environ.get("FITLIFE_PWD"), "driver": None}
 
 
 # ---------------------------------------------------------------------------
-# Truy cập CSDL
+# Truy cập CSDL (tái sử dụng 1 kết nối cho mỗi HTTP request qua flask.g)
 # ---------------------------------------------------------------------------
 def _conn_string():
     import pyodbc
@@ -47,12 +50,30 @@ def _conn_string():
     return cs
 
 
+def _get_db():
+    import pyodbc
+    cn = g.get("_db")
+    if cn is None:
+        cn = pyodbc.connect(_conn_string(), autocommit=True)
+        g._db = cn
+    return cn
+
+
+@app.teardown_appcontext
+def _close_db(_exc=None):
+    cn = g.pop("_db", None)
+    if cn is not None:
+        try:
+            cn.close()
+        except Exception:  # noqa: BLE001
+            pass
+
+
 def run_sql(sql, params=()):
     """Chạy một câu lệnh/batch, trả về danh sách tập kết quả: [{'cols': [...], 'rows': [[...], ...]}, ...]"""
-    import pyodbc
-    cn = pyodbc.connect(_conn_string(), autocommit=True)
+    cn = _get_db()
+    cur = cn.cursor()
     try:
-        cur = cn.cursor()
         cur.execute(sql, *params)
         sets = []
         while True:
@@ -62,7 +83,62 @@ def run_sql(sql, params=()):
                 break
         return sets
     finally:
-        cn.close()
+        cur.close()
+
+
+# ---------------------------------------------------------------------------
+# Xác thực, phân quyền RBAC & CSRF
+# ---------------------------------------------------------------------------
+def _csrf_token():
+    tok = session.get("_csrf")
+    if not tok:
+        tok = secrets.token_hex(32)
+        session["_csrf"] = tok
+    return tok
+
+
+@app.before_request
+def _check_csrf():
+    if request.method == "POST":
+        sent = request.form.get("_csrf", "")
+        expected = session.get("_csrf", "")
+        if not expected or not secrets.compare_digest(sent, expected):
+            abort(403, description="Phiên làm việc không hợp lệ hoặc thiếu mã CSRF.")
+
+
+def login_required(fn):
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        if not session.get("user"):
+            return redirect(url_for("login", next=request.path))
+        return fn(*args, **kwargs)
+    return wrapper
+
+
+def role_required(*roles):
+    def deco(fn):
+        @functools.wraps(fn)
+        def wrapper(*args, **kwargs):
+            u = session.get("user")
+            if not u:
+                return redirect(url_for("login", next=request.path))
+            if u.get("chuc_vu") not in roles:
+                abort(403, description="Bạn không có quyền thực hiện chức năng này.")
+            return fn(*args, **kwargs)
+        return wrapper
+    return deco
+
+
+def _to_int(val, default=None):
+    if val is None:
+        return default
+    s = str(val).strip()
+    if not s:
+        return default
+    try:
+        return int(s)
+    except ValueError:
+        return default
 
 
 def friendly_error(e):
@@ -153,6 +229,7 @@ def lk_khung_gio():
 BASE = """<!doctype html>
 <html lang="vi"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{{ title or 'FitLife Hub' }} · FitLife Hub</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 <style>
 :root{--bg:#f4f6f8;--card:#fff;--ink:#17202a;--mut:#5d6b7a;--line:#e2e7ed;--acc:#0b7a75;--acc2:#e8f5f4;--err:#b3261e;--errbg:#fdecea;--ok:#1b6e3c;--okbg:#e6f4ea}
 @media (prefers-color-scheme:dark){:root{--bg:#10161c;--card:#18212a;--ink:#e8edf2;--mut:#9aa9b8;--line:#2a3745;--acc:#3fc1b9;--acc2:#16302f;--err:#ff8a80;--errbg:#3a1b19;--ok:#7be0a0;--okbg:#17301f}}
@@ -181,7 +258,9 @@ th,td{padding:8px 10px;border-bottom:1px solid var(--line)}tr:last-child td{bord
 .inline{display:inline}.small{font-size:13px}canvas{max-height:300px}
 </style></head><body>
 <header><div class="bar"><div class="brand">FitLife Hub</div><nav>
-{% for k,t in menu %}<a href="{{ url_for(k) }}" class="{{ 'on' if active==k else '' }}">{{ t }}</a>{% endfor %}
+{% if current_user %}{% for k,t in menu %}{% if k != 'nhan_su' or current_user.chuc_vu == 'QUAN_LY' %}<a href="{{ url_for(k) }}" class="{{ 'on' if active==k else '' }}">{{ t }}</a>{% endif %}{% endfor %}
+<span class="mut small" style="margin-left:auto;padding:14px 8px">{{ current_user.ho_ten }} ({{ current_user.chuc_vu }})</span>
+<form method="post" action="{{ url_for('logout') }}" class="inline" style="padding:8px 0"><input type="hidden" name="_csrf" value="{{ csrf_token }}"><button class="sec" style="padding:5px 10px;font-size:13px">Đăng xuất</button></form>{% endif %}
 </nav></div></header>
 <main>
 {% for cat, m in get_flashed_messages(with_categories=true) %}<div class="msg {{ 'ok' if cat=='ok' else 'err' }}">{{ m }}</div>{% endfor %}
@@ -219,8 +298,17 @@ T["hoi_vien.html"] = """{% extends 'base.html' %}{% from 'macros.html' import tb
 <a class="btn sec" href="{{ url_for('hoi_vien_them') }}">+ Thêm hội viên</a></div></form>
 {% if q %}{{ tbl(kq, '/hoi-vien/') }}{% endif %}</div>{% endblock %}"""
 
+T["login.html"] = """{% extends 'base.html' %}{% block body %}
+<h1>Đăng nhập nhân viên</h1><div class="card" style="max-width:420px"><form method="post">
+<input type="hidden" name="_csrf" value="{{ csrf_token }}">
+<div style="margin-bottom:12px"><label>SĐT nhân viên</label><input name="sdt" required autofocus placeholder="vd: 090xxxxxxx"></div>
+<div style="margin-bottom:12px"><label>Mã PIN nhân viên</label><input name="pin" type="password" required></div>
+<button>Đăng nhập</button></form>
+<p class="mut small" style="margin-top:12px">Dùng SĐT của nhân viên đang làm việc trong bảng <code>NHAN_VIEN</code> và mã PIN (mặc định <code>123456</code> hoặc biến môi trường <code>FITLIFE_STAFF_PIN</code>).</p></div>{% endblock %}"""
+
 T["hoi_vien_them.html"] = """{% extends 'base.html' %}{% block body %}
 <h1>Thêm hội viên</h1><div class="card"><form method="post">
+<input type="hidden" name="_csrf" value="{{ csrf_token }}">
 <div class="row"><div><label>Mã thẻ</label><input name="ma_the" required placeholder="FL0030001"></div>
 <div><label>Họ tên</label><input name="ho_ten" required></div><div><label>SĐT</label><input name="sdt" required pattern="[0-9]{8,15}"></div>
 <div><label>Email</label><input name="email" type="email"></div></div>
@@ -235,19 +323,20 @@ T["hoi_vien_ct.html"] = """{% extends 'base.html' %}{% from 'macros.html' import
 <span class="pill">{{ hv.ten_hang }}</span></h1>
 <div class="grid g2">
 <div class="card"><h2>Thông tin</h2>
-<form method="post" action="{{ url_for('hoi_vien_sua', ma_hv=hv.ma_hv) }}"><div class="row">
+<form method="post" action="{{ url_for('hoi_vien_sua', ma_hv=hv.ma_hv) }}"><input type="hidden" name="_csrf" value="{{ csrf_token }}"><div class="row">
 <div><label>Họ tên</label><input name="ho_ten" value="{{ hv.ho_ten }}" required></div>
-<div><label>SĐT</label><input name="sdt" value="{{ hv.sdt }}" required></div>
-<div><label>Email</label><input name="email" value="{{ hv.email or '' }}"></div></div>
+<div><label>SĐT</label><input name="sdt" value="{{ hv.sdt }}" required pattern="[0-9]{8,15}"></div>
+<div><label>Email</label><input name="email" type="email" value="{{ hv.email or '' }}"></div></div>
 <p class="mut small">Mã thẻ {{ hv.ma_the }} · CCCD {{ hv.cccd }} · sinh {{ hv.ngay_sinh }} · đăng ký {{ hv.ngay_dang_ky }}</p>
 <button>Cập nhật</button></form>
-<form method="post" action="{{ url_for('hoi_vien_khoa', ma_hv=hv.ma_hv) }}" class="inline">
+{% if current_user.chuc_vu in ('QUAN_LY','LE_TAN') %}<form method="post" action="{{ url_for('hoi_vien_khoa', ma_hv=hv.ma_hv) }}" class="inline">
+<input type="hidden" name="_csrf" value="{{ csrf_token }}">
 <input type="hidden" name="khoa" value="{{ 0 if hv.trang_thai=='KHOA' else 1 }}">
-<button class="{{ 'sec' if hv.trang_thai=='KHOA' else 'danger' }}" style="margin-top:10px">{{ 'Mở khóa thẻ' if hv.trang_thai=='KHOA' else 'Khóa thẻ (xóa mềm)' }}</button></form></div>
+<button class="{{ 'sec' if hv.trang_thai=='KHOA' else 'danger' }}" style="margin-top:10px">{{ 'Mở khóa thẻ' if hv.trang_thai=='KHOA' else 'Khóa thẻ (xóa mềm)' }}</button></form>{% endif %}</div>
 <div class="card"><h2>Thân thiết</h2><p class="big">{{ hv.diem_hien_co|fmt }} <span class="mut small">điểm</span></p>
 <p class="mut">Chi tiêu 12 tháng: <b>{{ hv.tong_chi_tieu_12t|fmt }}</b> VNĐ</p><h2 style="margin-top:14px">Quyền vào cổng</h2>{{ tbl(quyen) }}</div>
 <div class="card"><h2>Đặt lịch PT</h2>
-{% if goi_pt %}<form method="post" action="{{ url_for('lich_pt_dat') }}"><input type="hidden" name="ma_hv" value="{{ hv.ma_hv }}">
+{% if goi_pt %}<form method="post" action="{{ url_for('lich_pt_dat') }}"><input type="hidden" name="_csrf" value="{{ csrf_token }}"><input type="hidden" name="ma_hv" value="{{ hv.ma_hv }}">
 <div class="row"><div><label>Gói PT còn buổi</label><select name="ma_goi_mua">{{ opts(goi_pt) }}</select></div>
 <div><label>Huấn luyện viên</label><select name="ma_hlv">{{ opts(hlv) }}</select></div></div>
 <div class="row"><div><label>Ngày tập</label><input type="date" name="ngay_tap" value="{{ ngay_mac_dinh }}" min="{{ ngay_mac_dinh }}" required></div>
@@ -257,16 +346,16 @@ T["hoi_vien_ct.html"] = """{% extends 'base.html' %}{% from 'macros.html' import
 </div>
 <div class="card"><h2>Lịch hẹn PT (3 tháng gần nhất)</h2><div class="scroll"><table><thead><tr><th>Mã</th><th>Ngày</th><th>Giờ</th><th>HLV</th><th>Chi nhánh</th><th>Trạng thái</th><th>Đánh giá</th><th></th></tr></thead><tbody>
 {% for r in lich.rows %}<tr><td>{{ r[0] }}</td><td>{{ r[1]|fmt }}</td><td>{{ r[2]|fmt }}</td><td>{{ r[3] }}</td><td>{{ r[4] }}</td><td>{{ r[5] }}</td><td>{{ r[6]|fmt }}{{ r[7] or '' }}</td>
-<td>{% if r[5]=='DA_DAT' %}<form method="post" action="{{ url_for('lich_pt_huy', ma_lich=r[0]) }}" class="inline"><input name="ly_do" placeholder="Lý do hủy" required style="width:140px">
+<td>{% if r[5]=='DA_DAT' %}<form method="post" action="{{ url_for('lich_pt_huy', ma_lich=r[0]) }}" class="inline"><input type="hidden" name="_csrf" value="{{ csrf_token }}"><input name="ly_do" placeholder="Lý do hủy" required style="width:140px">
 <input type="hidden" name="ma_hv" value="{{ hv.ma_hv }}"><button class="sec">Hủy</button></form>
-<form method="post" action="{{ url_for('lich_pt_xong', ma_lich=r[0]) }}" class="inline"><input type="hidden" name="ma_hv" value="{{ hv.ma_hv }}">
+<form method="post" action="{{ url_for('lich_pt_xong', ma_lich=r[0]) }}" class="inline"><input type="hidden" name="_csrf" value="{{ csrf_token }}"><input type="hidden" name="ma_hv" value="{{ hv.ma_hv }}">
 <select name="diem" style="width:70px"><option value="">★</option>{% for i in range(5,0,-1) %}<option>{{ i }}</option>{% endfor %}</select><button class="sec">Hoàn thành</button></form>{% endif %}</td></tr>
 {% else %}<tr><td colspan="8" class="mut">Không có dữ liệu.</td></tr>{% endfor %}</tbody></table></div></div>
 <div class="card"><h2>Lịch sử check-in (3 tháng gần nhất)</h2>{{ tbl(checkin) }}</div>
 {% endif %}{% endblock %}"""
 
 T["check_in.html"] = """{% extends 'base.html' %}{% from 'macros.html' import opts %}{% block body %}
-<h1>Check-in</h1><div class="card"><form method="post"><div class="row">
+<h1>Check-in</h1><div class="card"><form method="post"><input type="hidden" name="_csrf" value="{{ csrf_token }}"><div class="row">
 <div><label>Mã thẻ / QR</label><input name="ma_the" value="{{ ma_the }}" required autofocus placeholder="FL0000100"></div>
 <div><label>Cửa kiểm soát</label><select name="ma_cua">{{ opts(cua, ma_cua) }}</select></div>
 <div><button>Quét</button></div></div></form>
@@ -278,13 +367,17 @@ T["check_in.html"] = """{% extends 'base.html' %}{% from 'macros.html' import op
 T["hoa_don.html"] = """{% extends 'base.html' %}{% from 'macros.html' import tbl, opts %}{% block body %}
 <h1>Hóa đơn</h1><div class="grid g2">
 <div class="card"><h2>Lập hóa đơn</h2><form method="post" action="{{ url_for('hoa_don_lap') }}">
+<input type="hidden" name="_csrf" value="{{ csrf_token }}">
 <div class="row"><div><label>Mã hội viên (để trống = khách lẻ, chỉ mua sản phẩm)</label><input name="ma_hv" type="number" min="1" value="{{ request.args.get('ma_hv','') }}"></div>
-<div><label>Chi nhánh</label><select name="ma_cn">{{ opts(cn, 1) }}</select></div></div>
-<div class="row"><div><label>Nhân viên lập (lễ tân / NV bán hàng, đúng chi nhánh)</label><select name="ma_nv_lap">{{ opts(nv) }}</select></div>
+<div><label>Chi nhánh</label><select id="sel_cn" name="ma_cn">{{ opts(cn, 1) }}</select></div></div>
+<div class="row"><div><label>Nhân viên lập (lễ tân / NV bán hàng, đúng chi nhánh)</label><select id="sel_nv" name="ma_nv_lap">{% for r in nv %}<option value="{{ r[0] }}" data-cn="{{ r[4] }}">{{ r[1] }} · {{ r[2] }} · {{ r[3] }}</option>{% endfor %}</select></div>
 <div><label>Giảm giá (VNĐ)</label><input name="giam_gia" type="number" min="0" value="0"></div></div>
 <label>Gói dịch vụ</label><div class="row">{% for g in goi %}<label style="color:var(--ink)"><input type="checkbox" name="goi" value="{{ g[0] }}" style="width:auto"> {{ g[1] }} <span class="mut">({{ g[2]|fmt }})</span></label>{% endfor %}</div>
 <label>Sản phẩm</label>{% for i in range(3) %}<div class="row"><div><select name="sp">{{ opts(sp, None, '— chọn sản phẩm —') }}</select></div><div><input name="sl" type="number" min="1" value="1"></div></div>{% endfor %}
-<button>Lập hóa đơn</button></form></div>
+<button>Lập hóa đơn</button></form>
+<script>(function(){var cn=document.getElementById('sel_cn'),nv=document.getElementById('sel_nv');
+function f(){var v=cn.value,first=null;for(var i=0;i<nv.options.length;i++){var o=nv.options[i],ok=(o.dataset.cn===v);o.hidden=!ok;o.disabled=!ok;if(ok&&!first)first=o;}if(first&&(!nv.selectedOptions[0]||nv.selectedOptions[0].disabled))nv.value=first.value;}
+cn.addEventListener('change',f);f();})();</script></div>
 <div class="card"><h2>Hóa đơn mới nhất</h2>{{ tbl(gan_day, '/hoa-don/') }}</div></div>{% endblock %}"""
 
 T["hoa_don_ct.html"] = """{% extends 'base.html' %}{% from 'macros.html' import tbl %}{% block body %}
@@ -295,11 +388,11 @@ T["hoa_don_ct.html"] = """{% extends 'base.html' %}{% from 'macros.html' import 
 Hội viên: {% if hd.ma_hv %}<a href="{{ url_for('hoi_vien_ct', ma_hv=hd.ma_hv) }}">{{ hd.hoi_vien }}</a>{% else %}khách lẻ{% endif %}</p>
 <p>Tổng tiền <b>{{ hd.tong_tien|fmt }}</b> − giảm <b>{{ hd.giam_gia|fmt }}</b> = phải trả <span class="big">{{ hd.thanh_toan|fmt }}</span></p>
 <p class="mut">Đã trả: {{ da_tra|fmt }} · còn lại: {{ con_lai|fmt }}</p>
-{% if hd.trang_thai=='CHO_THANH_TOAN' %}<form method="post" action="{{ url_for('hoa_don_tt', ma_hd=hd.ma_hd) }}"><div class="row">
+{% if hd.trang_thai=='CHO_THANH_TOAN' %}<form method="post" action="{{ url_for('hoa_don_tt', ma_hd=hd.ma_hd) }}"><input type="hidden" name="_csrf" value="{{ csrf_token }}"><div class="row">
 <div><label>Hình thức</label><select name="hinh_thuc"><option value="TIEN_MAT">Tiền mặt</option><option value="VNPAY">VNPay</option><option value="THE">Thẻ</option></select></div>
 <div><label>Số tiền</label><input name="so_tien" type="number" min="1" value="{{ con_lai|int }}"></div>
 <div><label>Mã giao dịch cổng (VNPay/Thẻ)</label><input name="ma_gd"></div></div><button>Thanh toán</button></form>{% endif %}
-{% if hd.trang_thai!='DA_HUY' %}<form method="post" action="{{ url_for('hoa_don_huy', ma_hd=hd.ma_hd) }}" class="inline"><button class="danger" style="margin-top:10px">Hủy hóa đơn</button></form>{% endif %}</div>
+{% if hd.trang_thai!='DA_HUY' and current_user.chuc_vu == 'QUAN_LY' %}<form method="post" action="{{ url_for('hoa_don_huy', ma_hd=hd.ma_hd) }}" class="inline"><input type="hidden" name="_csrf" value="{{ csrf_token }}"><button class="danger" style="margin-top:10px">Hủy hóa đơn</button></form>{% endif %}</div>
 <div class="card"><h2>Gói dịch vụ</h2>{{ tbl(goi) }}<h2 style="margin-top:14px">Sản phẩm</h2>{{ tbl(sp) }}<h2 style="margin-top:14px">Thanh toán</h2>{{ tbl(tt) }}</div></div>
 {% endif %}{% endblock %}"""
 
@@ -311,22 +404,28 @@ T["bao_cao.html"] = """{% extends 'base.html' %}{% from 'macros.html' import tbl
 {% if 'cap' in dung %}<div><label>Cấp</label><select name="cap">{% for k,t in [('NGAY','Ngày'),('THANG','Tháng'),('QUY','Quý'),('NAM','Năm')] %}<option value="{{ k }}" {{ 'selected' if k==cap else '' }}>{{ t }}</option>{% endfor %}</select></div>{% endif %}
 {% if 'tu' in dung %}<div><label>Từ ngày</label><input type="date" name="tu" value="{{ tu }}"></div><div><label>Đến ngày</label><input type="date" name="den" value="{{ den }}"></div>{% endif %}
 {% if 'ngay' in dung %}<div><label>Ngày</label><input type="date" name="ngay" value="{{ ngay }}"></div><div><label>Từ giờ</label><input type="number" name="gio_tu" min="0" max="23" value="{{ gio_tu }}"></div><div><label>Đến giờ</label><input type="number" name="gio_den" min="0" max="23" value="{{ gio_den }}"></div>{% endif %}
-{% if 'thang' in dung %}<div><label>Tháng</label><input type="month" name="thang" value="{{ thang }}"></div><div><label><input type="checkbox" name="chot" value="1" style="width:auto"> Chốt kỳ</label></div>{% endif %}
+{% if 'thang' in dung %}<div><label>Tháng</label><input type="month" name="thang" value="{{ thang }}"></div>{% endif %}
 {% if 'han' in dung %}<div><label>Sắp hết hạn trong (ngày)</label><input type="number" name="n_han" min="1" value="{{ n_han }}"></div><div><label>Vắng quá (ngày)</label><input type="number" name="n_vang" min="1" value="{{ n_vang }}"></div>{% endif %}
-<div><button>Xem</button></div></div></form></div>
+<div><button>Xem</button></div></div></form>
+{% if loai == 'hoa_hong' and current_user.chuc_vu == 'QUAN_LY' %}
+<form method="post" action="{{ url_for('bao_cao_hoa_hong_tinh') }}" class="inline" style="margin-top:8px">
+<input type="hidden" name="_csrf" value="{{ csrf_token }}"><input type="hidden" name="thang" value="{{ thang }}">
+<button class="sec" name="chot" value="0">Tính lại hoa hồng</button>
+<button class="danger" name="chot" value="1">Chốt kỳ {{ thang }}</button></form>{% endif %}</div>
 {% if chart_labels %}<div class="card"><h2>Biểu đồ</h2>{{ chart('c1', chart_labels, chart_series, chart_kind) }}</div>{% endif %}
 {% for t, s in ket_qua %}<div class="card"><h2>{{ t }}</h2>{{ tbl(s) }}</div>{% endfor %}{% endblock %}"""
 
 T["nhan_su.html"] = """{% extends 'base.html' %}{% from 'macros.html' import tbl, opts %}{% block body %}
 <h1>Nhân sự</h1><div class="grid g2">
 <div class="card"><h2>Điều chuyển công tác</h2><form method="post" action="{{ url_for('nhan_su_dieu_chuyen') }}">
+<input type="hidden" name="_csrf" value="{{ csrf_token }}">
 <div class="row"><div><label>Nhân viên</label><select name="ma_nv">{{ opts(nv) }}</select></div>
 <div><label>Chi nhánh mới</label><select name="ma_cn_moi">{{ opts(cn) }}</select></div>
 <div><label>Từ ngày</label><input type="date" name="ngay" value="{{ ngay }}" required></div></div>
 <div class="row"><div><label>Lý do</label><input name="ly_do" value="Điều chuyển công tác"></div></div>
 <button>Điều chuyển</button></form>
 <p class="mut small">Hệ thống đóng giai đoạn cũ, mở giai đoạn mới cùng ngày. HLV còn lịch PT đã đặt từ ngày đó ở chi nhánh cũ sẽ bị từ chối (RB34).</p></div>
-<div class="card"><h2>Cập nhật lương cơ bản</h2><form method="post" action="{{ url_for('nhan_su_luong') }}"><div class="row">
+<div class="card"><h2>Cập nhật lương cơ bản</h2><form method="post" action="{{ url_for('nhan_su_luong') }}"><input type="hidden" name="_csrf" value="{{ csrf_token }}"><div class="row">
 <div><label>Nhân viên</label><select name="ma_nv">{{ opts(nv) }}</select></div><div><label>Lương mới (VNĐ)</label><input type="number" name="luong" min="0" step="100000" required></div></div>
 <button>Cập nhật</button></form></div></div>
 <div class="card"><h2>Lịch sử công tác (gần đây)</h2>{{ tbl(ls) }}</div>{% endblock %}"""
@@ -342,13 +441,48 @@ MENU = [("index", "Tổng quan"), ("hoi_vien", "Hội viên"), ("check_in", "Che
 
 @app.context_processor
 def inject():
-    return {"menu": MENU, "active": request.endpoint}
+    return {"menu": MENU, "active": request.endpoint, "csrf_token": _csrf_token(), "current_user": session.get("user")}
+
+
+# ---------------------------------------------------------------------------
+# Đăng nhập / Đăng xuất
+# ---------------------------------------------------------------------------
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    if request.method == "POST":
+        sdt = (request.form.get("sdt") or "").strip()
+        pin = request.form.get("pin") or ""
+        if not secrets.compare_digest(pin, STAFF_PIN):
+            flash("Sai mã PIN nhân viên.", "err")
+            return render_template("login.html", title="Đăng nhập")
+        r = rs(safe("""SELECT TOP (1) nv.ma_nv, nv.ho_ten, l.chuc_vu, l.ma_cn
+                       FROM dbo.NHAN_VIEN nv
+                       JOIN dbo.LICH_SU_CONG_TAC l ON l.ma_nv = nv.ma_nv AND l.den_ngay IS NULL
+                       WHERE nv.sdt = ? AND nv.trang_thai = 'DANG_LAM'""", (sdt,)))
+        if not r["rows"]:
+            flash("Không tìm thấy nhân viên đang làm việc với SĐT này.", "err")
+            return render_template("login.html", title="Đăng nhập")
+        row = r["rows"][0]
+        session["user"] = {"ma_nv": row[0], "ho_ten": row[1], "chuc_vu": row[2], "ma_cn": row[3]}
+        nxt = request.args.get("next") or ""
+        if not nxt.startswith("/") or nxt.startswith("//"):
+            nxt = url_for("index")
+        return redirect(nxt)
+    return render_template("login.html", title="Đăng nhập")
+
+
+@app.post("/logout")
+def logout():
+    session.pop("user", None)
+    flash("Đã đăng xuất.", "ok")
+    return redirect(url_for("login"))
 
 
 # ---------------------------------------------------------------------------
 # Tổng quan
 # ---------------------------------------------------------------------------
 @app.route("/")
+@login_required
 def index():
     den, tu = date.today(), date.today() - timedelta(days=29)
     dt = rs(safe("EXEC dbo.sp_BaoCaoDoanhThu @cap='NGAY', @tu=?, @den=?", (tu, den)))
@@ -364,6 +498,7 @@ def index():
 # Hội viên
 # ---------------------------------------------------------------------------
 @app.route("/hoi-vien")
+@login_required
 def hoi_vien():
     q = request.args.get("q", "").strip()
     kq = rs(safe("EXEC dbo.sp_TraCuuHoiVien @tu_khoa=?", (q,))) if q else {"cols": [], "rows": []}
@@ -371,12 +506,14 @@ def hoi_vien():
 
 
 @app.route("/hoi-vien/them", methods=["GET", "POST"])
+@role_required("QUAN_LY", "LE_TAN", "NV_BAN_HANG")
 def hoi_vien_them():
     if request.method == "POST":
         f = request.form
         try:
             r = rs(run_sql("EXEC dbo.sp_ThemHoiVien @ma_the=?, @ho_ten=?, @sdt=?, @email=?, @cccd=?, @gioi_tinh=?, @ngay_sinh=?",
-                           (f["ma_the"].strip(), f["ho_ten"].strip(), f["sdt"].strip(), f.get("email") or None,
+                           (f["ma_the"].strip(), f["ho_ten"].strip(), f["sdt"].strip(),
+                            (f.get("email") or "").strip() or None,
                             f["cccd"].strip(), f["gioi_tinh"], f["ngay_sinh"])))
             flash("Đã thêm hội viên.", "ok")
             return redirect(url_for("hoi_vien_ct", ma_hv=r["rows"][0][0]))
@@ -391,6 +528,7 @@ def hoi_vien_them():
 
 
 @app.route("/hoi-vien/<int:ma_hv>")
+@login_required
 def hoi_vien_ct(ma_hv):
     s = safe("""SELECT hv.ma_hv, hv.ma_the, hv.ho_ten, hv.sdt, hv.email, hv.cccd, hv.ngay_sinh, hv.ngay_dang_ky, hv.trang_thai,
                        h.ten_hang, t.diem_hien_co, t.tong_chi_tieu_12t
@@ -415,11 +553,12 @@ def hoi_vien_ct(ma_hv):
 
 
 @app.post("/hoi-vien/<int:ma_hv>/sua")
+@role_required("QUAN_LY", "LE_TAN", "NV_BAN_HANG")
 def hoi_vien_sua(ma_hv):
     f = request.form
     try:
         run_sql("EXEC dbo.sp_CapNhatHoiVien @ma_hv=?, @ho_ten=?, @sdt=?, @email=?",
-                (ma_hv, f["ho_ten"].strip(), f["sdt"].strip(), f.get("email") or None))
+                (ma_hv, f["ho_ten"].strip(), f["sdt"].strip(), (f.get("email") or "").strip() or None))
         flash("Đã cập nhật.", "ok")
     except Exception as e:  # noqa: BLE001
         flash("SĐT đã thuộc hội viên khác." if "UQ_HOI_VIEN" in str(e) else friendly_error(e), "err")
@@ -427,10 +566,11 @@ def hoi_vien_sua(ma_hv):
 
 
 @app.post("/hoi-vien/<int:ma_hv>/khoa")
+@role_required("QUAN_LY", "LE_TAN")
 def hoi_vien_khoa(ma_hv):
-    khoa = int(request.form.get("khoa", 1))
+    khoa = _to_int(request.form.get("khoa"), 1)
     try:
-        run_sql("EXEC dbo.sp_KhoaHoiVien @ma_hv=?, @khoa=?", (ma_hv, khoa))
+        run_sql("EXEC dbo.sp_KhoaHoiVien @ma_hv=?, @khoa=?", (ma_hv, 1 if khoa else 0))
         flash("Đã khóa thẻ." if khoa else "Đã mở khóa thẻ.", "ok")
     except Exception as e:  # noqa: BLE001
         flash(friendly_error(e), "err")
@@ -441,9 +581,13 @@ def hoi_vien_khoa(ma_hv):
 # Lịch PT
 # ---------------------------------------------------------------------------
 @app.post("/lich-pt/dat")
+@role_required("QUAN_LY", "LE_TAN", "PT")
 def lich_pt_dat():
     f = request.form
-    ma_hv = int(f["ma_hv"])
+    ma_hv = _to_int(f.get("ma_hv"))
+    if ma_hv is None:
+        flash("Thiếu mã hội viên hợp lệ.", "err")
+        return redirect(url_for("hoi_vien"))
     try:
         r = rs(run_sql("EXEC dbo.sp_DatLichPT @ma_hv=?, @ma_goi_mua=?, @ma_hlv=?, @ngay_tap=?, @ma_khung_gio=?",
                        (ma_hv, int(f["ma_goi_mua"]), int(f["ma_hlv"]), f["ngay_tap"], int(f["ma_khung_gio"]))))
@@ -454,10 +598,14 @@ def lich_pt_dat():
 
 
 @app.post("/lich-pt/<int:ma_lich>/huy")
+@role_required("QUAN_LY", "LE_TAN", "PT")
 def lich_pt_huy(ma_lich):
-    ma_hv = int(request.form["ma_hv"])
+    ma_hv = _to_int(request.form.get("ma_hv"))
+    if ma_hv is None:
+        flash("Thiếu mã hội viên hợp lệ.", "err")
+        return redirect(url_for("hoi_vien"))
     try:
-        run_sql("EXEC dbo.sp_HuyLichPT @ma_lich=?, @ly_do=?", (ma_lich, request.form["ly_do"].strip()))
+        run_sql("EXEC dbo.sp_HuyLichPT @ma_lich=?, @ly_do=?", (ma_lich, (request.form.get("ly_do") or "").strip()))
         flash("Đã hủy lịch và hoàn 1 buổi.", "ok")
     except Exception as e:  # noqa: BLE001
         flash(friendly_error(e), "err")
@@ -465,11 +613,15 @@ def lich_pt_huy(ma_lich):
 
 
 @app.post("/lich-pt/<int:ma_lich>/hoan-thanh")
+@role_required("QUAN_LY", "LE_TAN", "PT")
 def lich_pt_xong(ma_lich):
-    ma_hv = int(request.form["ma_hv"])
-    d = request.form.get("diem")
+    ma_hv = _to_int(request.form.get("ma_hv"))
+    if ma_hv is None:
+        flash("Thiếu mã hội viên hợp lệ.", "err")
+        return redirect(url_for("hoi_vien"))
+    d = _to_int(request.form.get("diem"))
     try:
-        run_sql("EXEC dbo.sp_HoanThanhLichPT @ma_lich=?, @diem_danh_gia=?", (ma_lich, int(d) if d else None))
+        run_sql("EXEC dbo.sp_HoanThanhLichPT @ma_lich=?, @diem_danh_gia=?", (ma_lich, d))
         flash("Đã đánh dấu hoàn thành.", "ok")
     except Exception as e:  # noqa: BLE001
         flash(friendly_error(e), "err")
@@ -480,13 +632,15 @@ def lich_pt_xong(ma_lich):
 # Check-in
 # ---------------------------------------------------------------------------
 @app.route("/check-in", methods=["GET", "POST"])
+@role_required("QUAN_LY", "LE_TAN", "NV_BAN_HANG")
 def check_in():
     cua = rs(safe("""SELECT k.ma_cua, cn.ten_cn, k.vi_tri FROM dbo.CUA_KIEM_SOAT k JOIN dbo.CHI_NHANH cn ON cn.ma_cn = k.ma_cn
                      WHERE k.trang_thai = 'HOAT_DONG' ORDER BY k.ma_cua"""))["rows"]
     kq, ms, ma_the, ma_cua = None, None, "", 1
     if request.method == "POST":
         import time
-        ma_the, ma_cua = request.form["ma_the"].strip(), int(request.form["ma_cua"])
+        ma_the = (request.form.get("ma_the") or "").strip()
+        ma_cua = _to_int(request.form.get("ma_cua"), 1)
         t0 = time.perf_counter()
         try:
             r = rs(run_sql("EXEC dbo.sp_CheckIn @ma_the=?, @ma_cua=?", (ma_the, ma_cua)))
@@ -501,6 +655,7 @@ def check_in():
 # Hóa đơn và thanh toán
 # ---------------------------------------------------------------------------
 @app.route("/hoa-don")
+@role_required("QUAN_LY", "LE_TAN", "NV_BAN_HANG")
 def hoa_don():
     gan = rs(safe("""SELECT TOP (15) hd.ma_hd, hd.ngay_lap, cn.ten_cn, hd.thanh_toan, hd.trang_thai
                      FROM dbo.HOA_DON hd JOIN dbo.CHI_NHANH cn ON cn.ma_cn = hd.ma_cn ORDER BY hd.ma_hd DESC"""))
@@ -509,6 +664,7 @@ def hoa_don():
 
 
 @app.post("/hoa-don/lap")
+@role_required("QUAN_LY", "LE_TAN", "NV_BAN_HANG")
 def hoa_don_lap():
     f = request.form
     try:
@@ -516,15 +672,16 @@ def hoa_don_lap():
         sp = {}
         for s, sl in zip(f.getlist("sp"), f.getlist("sl")):
             if s:
-                sp[int(s)] = sp.get(int(s), 0) + max(1, int(sl or 1))
-        ma_hv = int(f["ma_hv"]) if f.get("ma_hv") else None
+                sp[int(s)] = sp.get(int(s), 0) + max(1, _to_int(sl, 1))
+        ma_hv_raw = (f.get("ma_hv") or "").strip()
+        ma_hv = int(ma_hv_raw) if ma_hv_raw else None
         batch = "SET NOCOUNT ON; DECLARE @g dbo.ds_goi, @s dbo.ds_sp, @hd BIGINT;"
         if goi:
             batch += " INSERT INTO @g (ma_goi) VALUES " + ",".join(f"({g})" for g in goi) + ";"
         if sp:
             batch += " INSERT INTO @s (ma_sp, so_luong) VALUES " + ",".join(f"({k},{v})" for k, v in sp.items()) + ";"
         batch += (" EXEC dbo.sp_LapHoaDon @ma_hv=?, @ma_nv_lap=?, @ma_cn=?, @goi=@g, @sp=@s, @giam_gia=?, @ma_hd=@hd OUTPUT;")
-        r = rs(run_sql(batch, (ma_hv, int(f["ma_nv_lap"]), int(f["ma_cn"]), int(f.get("giam_gia") or 0))))
+        r = rs(run_sql(batch, (ma_hv, int(f["ma_nv_lap"]), int(f["ma_cn"]), _to_int(f.get("giam_gia"), 0))))
         flash("Đã lập hóa đơn, chờ thanh toán.", "ok")
         return redirect(url_for("hoa_don_ct", ma_hd=r["rows"][0][0]))
     except Exception as e:  # noqa: BLE001
@@ -533,6 +690,7 @@ def hoa_don_lap():
 
 
 @app.route("/hoa-don/<int:ma_hd>")
+@role_required("QUAN_LY", "LE_TAN", "NV_BAN_HANG")
 def hoa_don_ct(ma_hd):
     r = rs(safe("""SELECT hd.ma_hd, hd.ma_hv, hv.ho_ten AS hoi_vien, nv.ho_ten AS nhan_vien, cn.ten_cn, hd.ngay_lap,
                           hd.tong_tien, hd.giam_gia, hd.thanh_toan, hd.trang_thai
@@ -552,11 +710,15 @@ def hoa_don_ct(ma_hd):
 
 
 @app.post("/hoa-don/<int:ma_hd>/thanh-toan")
+@role_required("QUAN_LY", "LE_TAN", "NV_BAN_HANG")
 def hoa_don_tt(ma_hd):
     f = request.form
     try:
+        so_tien = _to_int(f.get("so_tien"))
+        if so_tien is None or so_tien <= 0:
+            raise ValueError("Số tiền thanh toán không hợp lệ.")
         run_sql("EXEC dbo.sp_ThanhToan @ma_hd=?, @hinh_thuc=?, @so_tien=?, @ma_giao_dich_cong=?",
-                (ma_hd, f["hinh_thuc"], int(f["so_tien"]), (f.get("ma_gd") or "").strip() or None))
+                (ma_hd, f["hinh_thuc"], so_tien, (f.get("ma_gd") or "").strip() or None))
         flash("Đã ghi nhận thanh toán.", "ok")
     except Exception as e:  # noqa: BLE001
         msg = friendly_error(e)
@@ -569,6 +731,7 @@ def hoa_don_tt(ma_hd):
 
 
 @app.post("/hoa-don/<int:ma_hd>/huy")
+@role_required("QUAN_LY")
 def hoa_don_huy(ma_hd):
     try:
         run_sql("EXEC dbo.sp_HuyHoaDon @ma_hd=?", (ma_hd,))
@@ -593,21 +756,22 @@ DUNG = {"doanh_thu": {"cn", "cap", "tu"}, "he_thong": {"tu"}, "lap_day": {"cn", 
 
 
 @app.route("/bao-cao")
+@login_required
 def bao_cao():
     a = request.args
     loai = a.get("loai", "doanh_thu")
     if loai not in DUNG:
         loai = "doanh_thu"
     today = date.today()
-    ma_cn = a.get("ma_cn") or ("1" if loai in ("lap_day", "ds_gio", "ban_chay", "ton_kho") else "")
+    ma_cn = (a.get("ma_cn") or "").strip() or ("1" if loai in ("lap_day", "ds_gio", "ban_chay", "ton_kho") else "")
     cap = a.get("cap", "THANG")
     tu = a.get("tu") or (today - timedelta(days=(30 if cap == "NGAY" else 365))).isoformat()
     den = a.get("den") or today.isoformat()
     ngay = a.get("ngay") or today.isoformat()
-    gio_tu, gio_den = int(a.get("gio_tu", 17)), int(a.get("gio_den", 20))
-    thang = a.get("thang") or (today.replace(day=1) - timedelta(days=1)).strftime("%Y-%m")
-    n_han, n_vang = int(a.get("n_han", 14)), int(a.get("n_vang", 30))
-    cnv = int(ma_cn) if ma_cn else None
+    gio_tu, gio_den = _to_int(a.get("gio_tu"), 17), _to_int(a.get("gio_den"), 20)
+    thang = (a.get("thang") or "").strip() or (today.replace(day=1) - timedelta(days=1)).strftime("%Y-%m")
+    n_han, n_vang = _to_int(a.get("n_han"), 14), _to_int(a.get("n_vang"), 30)
+    cnv = _to_int(ma_cn)
     kq, labels, series, kind = [], [], [], "bar"
     if loai == "doanh_thu":
         r = rs(safe("EXEC dbo.sp_BaoCaoDoanhThu @cap=?, @tu=?, @den=?, @ma_cn=?", (cap, tu, den, cnv)))
@@ -643,16 +807,35 @@ def bao_cao():
     elif loai == "goi_6t":
         kq = [("Gói doanh thu cao nhất", rs(safe("EXEC dbo.sp_GoiDoanhThuCaoNhat6Thang @top=10")))]
     elif loai == "hoa_hong":
-        kq = [("Hoa hồng PT", rs(safe("EXEC dbo.sp_TinhHoaHongThang @thang=?, @chot=?", (thang + "-01", 1 if a.get("chot") else 0))))]
+        kq = [("Hoa hồng PT", rs(safe("""SELECT h.ma_hlv, nv.ho_ten, h.ma_cn, h.thang, h.so_buoi_hoan_thanh, h.tong_hoa_hong, h.ngay_chot
+                                          FROM dbo.HOA_HONG_HLV_THANG h JOIN dbo.NHAN_VIEN nv ON nv.ma_nv = h.ma_hlv
+                                          WHERE h.thang = ? ORDER BY h.ma_hlv, h.ma_cn""", (thang + "-01",))))]
     return render_template("bao_cao.html", title="Báo cáo", loai=loai, loai_ds=LOAI, dung=DUNG[loai], cn=lk_chi_nhanh(), ma_cn=ma_cn,
                            cap=cap, tu=tu, den=den, ngay=ngay, gio_tu=gio_tu, gio_den=gio_den, thang=thang, n_han=n_han, n_vang=n_vang,
                            ket_qua=kq, chart_labels=[x for x in labels], chart_series=series, chart_kind=kind)
+
+
+@app.post("/bao-cao/hoa-hong/tinh")
+@role_required("QUAN_LY")
+def bao_cao_hoa_hong_tinh():
+    thang = (request.form.get("thang") or "").strip()
+    chot = 1 if request.form.get("chot") == "1" else 0
+    if not re.fullmatch(r"\d{4}-\d{2}", thang):
+        flash("Tháng không hợp lệ (định dạng YYYY-MM).", "err")
+        return redirect(url_for("bao_cao", loai="hoa_hong"))
+    try:
+        run_sql("EXEC dbo.sp_TinhHoaHongThang @thang=?, @chot=?", (thang + "-01", chot))
+        flash("Đã chốt kỳ hoa hồng." if chot else "Đã tính lại hoa hồng tháng.", "ok")
+    except Exception as e:  # noqa: BLE001
+        flash(friendly_error(e), "err")
+    return redirect(url_for("bao_cao", loai="hoa_hong", thang=thang))
 
 
 # ---------------------------------------------------------------------------
 # Nhân sự
 # ---------------------------------------------------------------------------
 @app.route("/nhan-su")
+@role_required("QUAN_LY")
 def nhan_su():
     nv = rs(safe("""SELECT nv.ma_nv, nv.ho_ten, l.chuc_vu, cn.ten_cn FROM dbo.NHAN_VIEN nv
                     JOIN dbo.LICH_SU_CONG_TAC l ON l.ma_nv = nv.ma_nv AND l.den_ngay IS NULL
@@ -665,11 +848,12 @@ def nhan_su():
 
 
 @app.post("/nhan-su/dieu-chuyen")
+@role_required("QUAN_LY")
 def nhan_su_dieu_chuyen():
     f = request.form
     try:
         run_sql("EXEC dbo.sp_DieuChuyenNhanVien @ma_nv=?, @ma_cn_moi=?, @ngay=?, @ly_do=?",
-                (int(f["ma_nv"]), int(f["ma_cn_moi"]), f["ngay"], f.get("ly_do") or "Điều chuyển công tác"))
+                (int(f["ma_nv"]), int(f["ma_cn_moi"]), f["ngay"], (f.get("ly_do") or "").strip() or "Điều chuyển công tác"))
         flash("Đã điều chuyển nhân viên.", "ok")
     except Exception as e:  # noqa: BLE001
         flash(friendly_error(e), "err")
@@ -677,9 +861,13 @@ def nhan_su_dieu_chuyen():
 
 
 @app.post("/nhan-su/luong")
+@role_required("QUAN_LY")
 def nhan_su_luong():
     try:
-        run_sql("EXEC dbo.sp_CapNhatLuong @ma_nv=?, @luong_moi=?", (int(request.form["ma_nv"]), int(request.form["luong"])))
+        luong = _to_int(request.form.get("luong"))
+        if luong is None or luong < 0:
+            raise ValueError("Mức lương không hợp lệ.")
+        run_sql("EXEC dbo.sp_CapNhatLuong @ma_nv=?, @luong_moi=?", (int(request.form["ma_nv"]), luong))
         flash("Đã cập nhật lương cơ bản.", "ok")
     except Exception as e:  # noqa: BLE001
         flash(friendly_error(e), "err")
